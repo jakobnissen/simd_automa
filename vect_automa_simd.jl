@@ -1,3 +1,5 @@
+module t
+
 using SIMD
 import Automa: ByteSet, Machine, traverse
 import Automa
@@ -29,6 +31,12 @@ const v128 = Vec{16, UInt8}
 # Generalize to 32-byte? Or is that too silly?
 @inline function vpshufb(x::v128, mask::v128)
     v128(ccall("llvm.x86.ssse3.pshuf.b.128", llvmcall, i128, (i128, i128), x.data, mask.data))
+end
+
+
+
+@inline function vpshufb(x::v128, mask::v128)
+    v128(ccall("llvm.x86.avx2.pshuf.b", llvmcall, i128, (i128, i128), x.data, mask.data))
 end
 
 const bitshift_mask = v128((0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
@@ -435,7 +443,4 @@ end
 # Here, a list of 
 
 
-
-code = quote
-    @goto state_1
-end
+end # module
