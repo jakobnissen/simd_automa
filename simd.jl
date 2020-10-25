@@ -1,6 +1,7 @@
 module t
 
 # This should be an Automa.Simd module that should be loaded
+# All the vec_* (soon to be zero_) function should be exported
 
 using SIMD
 using Libdl
@@ -81,10 +82,10 @@ end
 # If not inverted, all inputs with top bit will be set to 0x00, and then inv'd to 0xff.
 # This will cause all shifts to fail.
 # If inverted and ascii, we set offset to 0x80
-@inline function vec_within128(x::T, lut::T, offset::UInt8, invert::Bool) where {T <: BVec}
-    f = invert ? identity : Base.:~
-    bitmap = f(vpshufb(lut, x - offset))
-    return bitmap & bitshift_ones(shrl4(x))
+@inline function vec_within128(x::T, lut::T, offset::UInt8, f::Function) where {T <: BVec}
+    y = x - offset
+    bitmap = f(vpshufb(lut, y))
+    return bitmap & bitshift_ones(shrl4(y))
 end
 
 @inline function vec_8elem(x::T, lut1::T, lut2::T) where {T <: BVec}
@@ -104,7 +105,20 @@ end
 # One where it's a single range. After subtracting low, all values below end
 # up above due to overflow and we can simply do a single le check
 @inline function vec_range(x::BVec, low::UInt8, len::UInt8)
-    toUInt8((x - low) < len)
+    toUInt8((x - low) > (len - 1))
+end
+
+# One where, in all the disallowed values, the lower nibble is unique.
+# This one is surprisingly common and very efficient.
+# If all 0x80:0xff are allowed, the mask can be 0xff, and is compiled away
+@inline function vec_invert_unique_nibble(x::T, lut::T, mask::UInt8) where {T <: BVec}
+    # If upper bit is set, vpshufb yields 0x00, and the xor non-zeros it. 
+    return toUInt8(x ⊻ vpshufb(lut, x & mask) == 0x00)
+end
+
+# Same as above, but inverted. Even better!
+@inline function vec_unique_nibble(x::T, lut::T, mask::UInt8) where {T <: BVec}
+    return x ⊻ vpshufb(lut, x & mask)
 end
 
 # Simplest of all!
@@ -115,11 +129,11 @@ function load_lut(::Type{T}, v::Vector{UInt8}) where {T <: BVec}
     return unsafe_load(Ptr{T}(pointer(v)))
 end  
 
-function generic_luts(::Type{T}, byteset::ByteSet, offset::UInt8, ascii::Bool) where {
+function generic_luts(::Type{T}, byteset::ByteSet, offset::UInt8, invert::Bool) where {
     T <: BVec}
     # If ascii, we set each allowed bit, but invert after vpshufb. Hence, if top bit
     # is set, it returns 0x00 and is inverted to 0xff, guaranteeing failure
-    topzero = fill(ascii ? 0x00 : 0xff, 16)
+    topzero = fill(invert ? 0xff : 0x00, 16)
     topone = copy(topzero)
     for byte in byteset
         byte -= offset
@@ -132,7 +146,7 @@ function generic_luts(::Type{T}, byteset::ByteSet, offset::UInt8, ascii::Bool) w
         shift = (byte >> 0x04) & 0x07
         bitmap[index] ⊻= 0x01 << shift
     end
-    return load_lut(T, topzero), load_lut(T, topzero)
+    return load_lut(T, topzero), load_lut(T, topone)
 end
 
 function elem8_luts(::Type{T}, byteset::ByteSet) where {T <: BVec}
@@ -154,11 +168,20 @@ function within16_lut(::Type{T}, byteset::ByteSet) where {T <: BVec}
     end
     return load_lut(T, lut)
 end
-    
+
+function unique_lut(::Type{T}, byteset::ByteSet, invert::Bool) where {T <: BVec}
+    # The default, unset value of the vector v must be one where v[x & 0x0f + 1] ⊻ x
+    # is never accidentally zero.
+    allowed = collect(0x01:0x10)
+    for byte in (invert ? ~byteset : byteset)
+        allowed[(byte & 0b00001111) + 1] = byte
+    end
+    return load_lut(T, allowed)
+end 
 
 ########## Testing code below
 function make_generic_veccode(x::ByteSet)
-    lut1, lut2 = generic_luts(DEFVEC, x, 0x00, false)
+    lut1, lut2 = generic_luts(DEFVEC, x, 0x00, true)
     return :(vec_generic(x, $lut1, $lut2))
 end
 
@@ -168,17 +191,17 @@ function make_8elem_veccode(x::ByteSet)
 end
 
 function make_128_veccode(x::ByteSet, ascii::Bool, inverted::Bool)
-    offset = if ascii
-        if inverted
-            0x80
-        else
-            0x00
-        end
+    if ascii && !inverted
+        offset, f, invert = 0x00, ~, false
+    elseif ascii && inverted
+        offset, f, invert = 0x80, ~, false
+    elseif !ascii && !inverted
+        offset, f, invert = minimum(x), ~, false
     else
-        minimum(inverted ? ~x : x)
+        offset, f, invert = minimum(~x), identity, true
     end
-    lut = generic_luts(DEFVEC, x, offset, inverted)[1]
-    return :(vec_within128(x, $lut, $offset, $(inverted & !ascii)))
+    lut = generic_luts(DEFVEC, x, offset, invert)[1]
+    return :(vec_within128(x, $lut, $offset, $f))
 end
 
 function make_within16_code(x::ByteSet)
@@ -196,44 +219,93 @@ function make_inv_range_code(x::ByteSet)
     return :(vec_range(x, $(maximum(~x) + 0x01), $(UInt8(length(x)))))
 end
 
+function make_unique_nibble_code(x::ByteSet, invert::Bool)
+    lut = unique_lut(DEFVEC, x, invert)
+    mask = maximum(invert ? ~x : x) > 0x7f ? 0x0f : 0xff
+    if invert
+        return :(vec_invert_unique_nibble(x, $lut, $mask))
+    else
+        return :(vec_unique_nibble(x, $lut, $mask))
+    end
+end
+
 make_allsame_code(x::ByteSet) = :(vec_same(x, $(minimum(x))))
 
 
 # TODO: Make something useful of this.
 function gencode(x::ByteSet)
     if length(x) == 1
+        #println("Allsame")
         return return make_allsame_code(x)
+    elseif length(x) == length(Set([i & 0x0f for i in x]))
+        #println("Unique nibble")
+        return make_unique_nibble_code(x, false)
+    elseif length(~x) == length(Set([i & 0x0f for i in ~x]))
+        #println("Invert unique nibble") 
+        return make_unique_nibble_code(x, true)
     elseif iscontiguous(x)
+        #println("Range code")
         return make_range_code(x)
     elseif iscontiguous(~x)
     # Inverted range
+        #println("Inverted range code")
         return make_inv_range_code(x)
     elseif maximum(x) - minimum(x) < 16
+        #println("Within 16")
         return make_within16_code(x)
     # Inverted ASCII
     elseif minimum(x) > 127
+        #println("Inv ascii")
         return make_128_veccode(x, true, true)
     # Ascii
     elseif maximum(x) < 128
+        #println("ASCII")
         return make_128_veccode(x, true, false)
     # Inverted within 128
     elseif maximum(~x) - minimum(~x) < 128
+        #println("Inverted 128")
         return make_128_veccode(x, false, true)
     # Within 128
     elseif maximum(x) - minimum(x) < 128
+        #println("128 code")
         return make_128_veccode(x, false, false)
     elseif length(x) < 9
+        #println("8 set code")
         return make_8elem_veccode(x)
     else
+        #println("Generic")
         return make_generic_veccode(x)
     end
 end
 
 
 ###
+function test_function(f::Function, bs::ByteSet)
+    pass = true
+    for i in 0x00:0x0f
+        v = f(load_lut(DEFVEC, collect((0x00:0x0f))) + (UInt8(i) * 0x10))
+        for j in 0x00:0x0f
+            n = (0x10 * i) + j
+            pass &= ((n in bs) == (v[j+1] == 0x00))
+            #println(pass, " ", n in bs, " ", v[j+1] == 0x00)
+        end
+    end
+    return pass
+end
+
 bs_same = ByteSet([0x07])
 @eval function f_same(x)
     y = $(gencode(bs_same))
+end
+
+bs_unique_nibble = ByteSet([0x02, 0x0a, 0x1b, 0x1c, 0x1d, 0x20, 0x7e])
+@eval function f_unique_nibble(x)
+    y = $(make_unique_nibble_code(bs_unique_nibble, false))
+end
+
+bs_inv_unique_nibble = ~bs_unique_nibble
+@eval function f_inv_unique_nibble(x)
+    y = $(make_unique_nibble_code(bs_inv_unique_nibble, true))
 end
 
 bs_range = ByteSet(0xa9:0xc1)
@@ -247,7 +319,7 @@ bs_inv_range = ByteSet([0x00:0x09; 0x4a:0xff])
 end
 
 bs_within_16 = ByteSet([0x45, 0x48, 0x49, 0x50, 0x52, 0x53])
-@eval function f_witin16(x)
+@eval function f_within_16(x)
     y = $(gencode(bs_within_16))
 end
 
@@ -260,4 +332,28 @@ bs_ascii = ByteSet(rand(0x0a:0x61, 50))
 @eval function f_ascii(x)
     y = $(gencode(bs_ascii))
 end
+
+bs_inv_128 = ~ByteSet(rand(0x31:0xa1, 50))
+@eval function f_inv_128(x)
+    y = $(gencode(bs_inv_128))
+end
+
+bs_128 = ByteSet(rand(0x31:0xa1, 50))
+@eval function f_128(x)
+    y = $(gencode(bs_128))
+end
+
+bs_8 = ByteSet(rand(0x00:0xff, 8))
+@eval function f_8(x)
+    y = $(gencode(bs_8))
+end
+
+bs_generic = ByteSet(rand(0x00:0xff, 75))
+@eval function f_generic(x)
+    y = $(gencode(bs_generic))
+end
+
+
+## experimental code
+
 end # t
