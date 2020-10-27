@@ -11,8 +11,6 @@ import Automa: ByteSet
 const v256 = Vec{32, UInt8}
 const v128 = Vec{16, UInt8}
 const BVec = Union{v128, v256}
-const t256 = NTuple{32, VecElement{UInt8}}
-const t128 = NTuple{16, VecElement{UInt8}} 
 
 # Discover if the system has SSSE or AVX2
 let
@@ -27,22 +25,75 @@ let
     Libc.free(features_cstring)
     @eval const SSSE3 = $(any(isequal("+ssse3"), features))
     @eval const AVX2 = $(any(isequal("+avx2"), features))
+    @eval const SSE2 = $(any(isequal("+sse2"), features))
     @eval const DEFVEC = AVX2 ? v256 : v128
 end
 
-@inline function vpshufb(x::v256, mask::v256)
-    v256(ccall("llvm.x86.avx2.pshuf.b", llvmcall, t256, (t256, t256), x.data, mask.data))
+"""
+    vpcmpeqb(a::BVec, b::BVec) -> BVec
+
+Compare vectors `a` and `b` element wise and return a vector with `0x00`
+where elements are not equal, and `0xff` where they are. Maps to the `vpcmpeqb`
+AVX2 CPU instruction, or the `pcmpeqb` SSE2 instruction.
+"""
+function vpcmpeqb end
+
+"""
+    vpshufb(a::BVec, b::BVec) -> BVec
+
+Maps to the AVX2 `vpshufb` instruction or the SSSE3 `pshufb` instruction depending
+on the width of the BVec.
+"""
+function vpshufb end
+
+"""
+    vec_uge(a::BVec, b::BVec) -> BVec
+
+Compare vectors `a` and `b` element wise and return a vector with `0xff`
+where `a[i] ≥ b[i]``, and `0x00` otherwise. Implemented efficiently for CPUs
+with the `vpcmpeqb` and `vpmaxub` instructions.
+
+See also: [`vpcmpeqb`](@ref)
+"""
+function vec_uge end
+
+let
+    nt256 = NTuple{32, VecElement{UInt8}}
+    nt128 = NTuple{16, VecElement{UInt8}}
+    # icmp eq instruction yields bool (i1) values. We extend with sext to 0x00/0xff.
+    # since that's the native output of vcmpeqb instruction, LLVM will optimize it
+    # to just that.
+    llvm_template = """%res = icmp eq <N x i8> %0, %1
+    %resb = sext <N x i1> %res to <N x i8>
+    ret <N x i8> %resb
+    """
+    llvm_template2 = """%res = icmp uge <N x i8> %0, %1
+    %resb = sext <N x i1> %res to <N x i8>
+    ret <N x i8> %resb
+    """
+    for N in (16, 32)
+        T = NTuple{N, VecElement{UInt8}}
+        ST = Vec{N, UInt8}
+        instruction_set = N == 16 ? "ssse3" : "avx2"
+        intrinsic = "llvm.x86.$(instruction_set).pshuf.b"
+        llvm_code = replace(llvm_template, "<N x" => "<$(sizeof(T)) x")
+        @eval @inline function vpcmpeqb(a::$ST, b::$ST)
+            $(ST)(Base.llvmcall($llvm_code, $T, Tuple{$T, $T}, a.data, b.data))
+        end
+
+        @eval @inline function vpshufb(a::$ST, b::$ST)
+            $(ST)(ccall($intrinsic, llvmcall, $T, ($T, $T), a.data, b.data))
+        end
+
+        @eval const $(Symbol("_SHIFT", string(8N))) = $(ST)(ntuple(i -> 0x01 << ((i-1)%8), $N))
+        @eval @inline bitshift_ones(shift::$ST) = vpshufb($(Symbol("_SHIFT", string(8N))), shift)
+
+        llvm_code2 = replace(llvm_template2, "<N x" => "<$(sizeof(T)) x")
+        @eval @inline function vec_uge(a::$ST, b::$ST)
+            $(ST)(Base.llvmcall($llvm_code2, $T, Tuple{$T, $T}, a.data, b.data))
+        end
+    end
 end
-
-@inline function vpshufb(x::v128, mask::v128)
-    v128(ccall("llvm.x86.ssse3.pshuf.b.128", llvmcall, t128, (t128, t128), x.data, mask.data))
-end
-
-const _SHIFT128 = v128(ntuple(i -> 0x01 << ((i-1)%8), 16))
-@inline bitshift_ones(shift::v128) = vpshufb(_SHIFT128, shift)
-
-const _SHIFT256 = v256(ntuple(i -> 0x01 << ((i-1)%8), 32))
-@inline bitshift_ones(shift::v256) = vpshufb(_SHIFT256, shift)
 
 @inline function haszerolayout(x::v128)
     return iszero(unsafe_load(Ptr{UInt128}(pointer_from_objref(Ref(x)))))
@@ -58,10 +109,6 @@ end
     unsafe_load(Ptr{T}(p))
 end
 
-@inline function toUInt8(x::Vec{N, Bool}) where N
-    unsafe_load(Ptr{Vec{N, UInt8}}(pointer_from_objref(Ref(x))))
-end
-
 # We have this to keep the same constant mask in memory.
 @inline shrl4(x) = x >>> 0x04
 
@@ -69,9 +116,8 @@ Base.:~(x::ByteSet) = ByteSet(~x.a, ~x.b, ~x.c, ~x.d)
 iscontiguous(x::ByteSet) = maximum(x) - minimum(x) == length(x) - 1
 
 @inline function vec_generic(x::T, topzero::T, topone::T) where {T <: BVec}
-    y = x & 0b10001111
-    lower = vpshufb(topzero, y)
-    upper = vpshufb(topone, y ⊻ 0b10000000)
+    lower = vpshufb(topzero, x)
+    upper = vpshufb(topone, x ⊻ 0b10000000)
     bitmap = lower | upper
     return bitmap & bitshift_ones(shrl4(x))
 end
@@ -92,7 +138,7 @@ end
     # Get a 8-bit bitarray of the possible ones
     mask = vpshufb(lut1, x & 0b00001111)
     shifted = vpshufb(lut2, shrl4(x))
-    return toUInt8((mask & shifted) == 0x00)
+    return vpcmpeqb(shifted, mask & shifted)
 end
 
 # Here's one where they're 16 apart at most.
@@ -103,23 +149,27 @@ end
 end
 
 # One where it's a single range. After subtracting low, all values below end
-# up above due to overflow and we can simply do a single le check
+# up above due to overflow and we can simply do a single ge check
 @inline function vec_range(x::BVec, low::UInt8, len::UInt8)
-    toUInt8((x - low) > (len - 1))
+    vec_uge((x - low), v256(len))
 end
+
 
 # One where, in all the disallowed values, the lower nibble is unique.
 # This one is surprisingly common and very efficient.
 # If all 0x80:0xff are allowed, the mask can be 0xff, and is compiled away
 @inline function vec_invert_unique_nibble(x::T, lut::T, mask::UInt8) where {T <: BVec}
     # If upper bit is set, vpshufb yields 0x00, and the xor non-zeros it. 
-    return toUInt8(x ⊻ vpshufb(lut, x & mask) == 0x00)
+    return vpcmpeqb(x, vpshufb(lut, x & mask))
 end
+
 
 # Same as above, but inverted. Even better!
 @inline function vec_unique_nibble(x::T, lut::T, mask::UInt8) where {T <: BVec}
     return x ⊻ vpshufb(lut, x & mask)
 end
+
+@inline vec_not(x::BVec, y::UInt8) = vpcmpeqb(x, typeof(x)(y))
 
 # Simplest of all!
 @inline vec_same(x::BVec, y::UInt8) = x ⊻ y
@@ -150,14 +200,14 @@ function generic_luts(::Type{T}, byteset::ByteSet, offset::UInt8, invert::Bool) 
 end
 
 function elem8_luts(::Type{T}, byteset::ByteSet) where {T <: BVec}
-    lower = fill(0x00, 16)
-    upper = copy(lower)
+    allowed_mask = fill(0xff, 16)
+    bitindices = fill(0x00, 16)
     for (i, byte) in enumerate(byteset)
         bitindex = 0x01 << (i - 1)
-        lower[(byte & 0x0f) + 0x01] ⊻= bitindex
-        upper[(byte >>> 0x04) + 0x01] ⊻= bitindex
+        allowed_mask[(byte & 0x0f) + 0x01] ⊻= bitindex
+        bitindices[(byte >>> 0x04) + 0x01] ⊻= bitindex
     end
-    return load_lut(T, lower), load_lut(T, upper)
+    return load_lut(T, allowed_mask), load_lut(T, bitindices)
 end
 
 function within16_lut(::Type{T}, byteset::ByteSet) where {T <: BVec}
@@ -230,13 +280,15 @@ function make_unique_nibble_code(x::ByteSet, invert::Bool)
 end
 
 make_allsame_code(x::ByteSet) = :(vec_same(x, $(minimum(x))))
-
+make_not_code(x::ByteSet) = :(vec_not(x, $(minimum(~x))))
 
 # TODO: Make something useful of this.
 function gencode(x::ByteSet)
     if length(x) == 1
         #println("Allsame")
-        return return make_allsame_code(x)
+        return make_allsame_code(x)
+    elseif length(x) == 255
+        return make_not_code(x)
     elseif length(x) == length(Set([i & 0x0f for i in x]))
         #println("Unique nibble")
         return make_unique_nibble_code(x, false)
@@ -298,6 +350,11 @@ bs_same = ByteSet([0x07])
     y = $(gencode(bs_same))
 end
 
+bs_not = ~ByteSet([0xb3])
+@eval function f_not(x)
+    y = $(gencode(bs_not))
+end
+
 bs_unique_nibble = ByteSet([0x02, 0x0a, 0x1b, 0x1c, 0x1d, 0x20, 0x7e])
 @eval function f_unique_nibble(x)
     y = $(make_unique_nibble_code(bs_unique_nibble, false))
@@ -318,7 +375,7 @@ bs_inv_range = ByteSet([0x00:0x09; 0x4a:0xff])
     y = $(gencode(bs_inv_range))
 end
 
-bs_within_16 = ByteSet([0x45, 0x48, 0x49, 0x50, 0x52, 0x53])
+bs_within_16 = ByteSet([0x45, 0x48, 0x49, 0x50, 0x55, 0x53])
 @eval function f_within_16(x)
     y = $(gencode(bs_within_16))
 end
