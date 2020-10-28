@@ -11,8 +11,9 @@ import Automa: ByteSet
 const v256 = Vec{32, UInt8}
 const v128 = Vec{16, UInt8}
 const BVec = Union{v128, v256}
+const _ZERO_v256 = v256(ntuple(i -> VecElement{UInt8}(0x00), 32))
 
-# Discover if the system has SSSE or AVX2
+# Discover if the system CPU has SSSE or AVX2 instruction sets
 let
     llvmpaths = filter(lib -> occursin(r"LLVM\b", basename(lib)), Libdl.dllist())
     if length(llvmpaths) != 1
@@ -63,11 +64,12 @@ let
     # icmp eq instruction yields bool (i1) values. We extend with sext to 0x00/0xff.
     # since that's the native output of vcmpeqb instruction, LLVM will optimize it
     # to just that.
-    llvm_template = """%res = icmp eq <N x i8> %0, %1
+    vpcmpeqb_template = """%res = icmp eq <N x i8> %0, %1
     %resb = sext <N x i1> %res to <N x i8>
     ret <N x i8> %resb
     """
-    llvm_template2 = """%res = icmp uge <N x i8> %0, %1
+
+    uge_template = """%res = icmp uge <N x i8> %0, %1
     %resb = sext <N x i1> %res to <N x i8>
     ret <N x i8> %resb
     """
@@ -76,9 +78,10 @@ let
         ST = Vec{N, UInt8}
         instruction_set = N == 16 ? "ssse3" : "avx2"
         intrinsic = "llvm.x86.$(instruction_set).pshuf.b"
-        llvm_code = replace(llvm_template, "<N x" => "<$(sizeof(T)) x")
+        vpcmpeqb_code = replace(vpcmpeqb_template, "<N x" => "<$(sizeof(T)) x")
+
         @eval @inline function vpcmpeqb(a::$ST, b::$ST)
-            $(ST)(Base.llvmcall($llvm_code, $T, Tuple{$T, $T}, a.data, b.data))
+            $(ST)(Base.llvmcall($vpcmpeqb_code, $T, Tuple{$T, $T}, a.data, b.data))
         end
 
         @eval @inline function vpshufb(a::$ST, b::$ST)
@@ -88,11 +91,35 @@ let
         @eval const $(Symbol("_SHIFT", string(8N))) = $(ST)(ntuple(i -> 0x01 << ((i-1)%8), $N))
         @eval @inline bitshift_ones(shift::$ST) = vpshufb($(Symbol("_SHIFT", string(8N))), shift)
 
-        llvm_code2 = replace(llvm_template2, "<N x" => "<$(sizeof(T)) x")
+        uge_code = replace(uge_template, "<N x" => "<$(sizeof(T)) x")
         @eval @inline function vec_uge(a::$ST, b::$ST)
-            $(ST)(Base.llvmcall($llvm_code2, $T, Tuple{$T, $T}, a.data, b.data))
+            $(ST)(Base.llvmcall($uge_code, $T, Tuple{$T, $T}, a.data, b.data))
         end
     end
+end
+
+"""
+    vpmovmskb(a::v256) -> v256
+
+Moves the upper bits of each byte in a `v256` value to an `UInt32`.
+Maps to the AVX2 instruction `vpmovmskb`
+"""
+@inline function vpmovmskb(v::v256)
+    eqzero = vpcmpeqb(v, _ZERO_v256).data
+    packed = ccall("llvm.x86.avx2.pmovmskb", llvmcall, UInt32, (NTuple{32, VecElement{UInt8}},), eqzero)
+    return leading_ones(packed)
+end
+
+@inline leading_zero_bytes(v::v256) = vpmovmskb(v)
+
+# vpmovmskb requires AVX2, so we fall back to this.
+@inline function leading_zero_bytes(v::v128)
+    n = 0
+    @inbounds for i in v.data
+        iszero(i.value) || break
+        n += 1
+    end
+    return n
 end
 
 @inline function haszerolayout(x::v128)
@@ -151,15 +178,15 @@ end
 # One where it's a single range. After subtracting low, all values below end
 # up above due to overflow and we can simply do a single ge check
 @inline function vec_range(x::BVec, low::UInt8, len::UInt8)
-    vec_uge((x - low), v256(len))
+    vec_uge((x - low), typeof(x)(len))
 end
-
 
 # One where, in all the disallowed values, the lower nibble is unique.
 # This one is surprisingly common and very efficient.
 # If all 0x80:0xff are allowed, the mask can be 0xff, and is compiled away
 @inline function vec_invert_unique_nibble(x::T, lut::T, mask::UInt8) where {T <: BVec}
-    # If upper bit is set, vpshufb yields 0x00, and the xor non-zeros it. 
+    # If upper bit is set, vpshufb yields 0x00. 0x00 is not equal to any bytes with the
+    # upper biset set, so the comparison will return 0x00, allowing it.
     return vpcmpeqb(x, vpshufb(lut, x & mask))
 end
 
@@ -169,9 +196,8 @@ end
     return x ⊻ vpshufb(lut, x & mask)
 end
 
-@inline vec_not(x::BVec, y::UInt8) = vpcmpeqb(x, typeof(x)(y))
-
 # Simplest of all!
+@inline vec_not(x::BVec, y::UInt8) = vpcmpeqb(x, typeof(x)(y))
 @inline vec_same(x::BVec, y::UInt8) = x ⊻ y
 
 function load_lut(::Type{T}, v::Vector{UInt8}) where {T <: BVec}
@@ -285,47 +311,30 @@ make_not_code(x::ByteSet) = :(vec_not(x, $(minimum(~x))))
 # TODO: Make something useful of this.
 function gencode(x::ByteSet)
     if length(x) == 1
-        #println("Allsame")
         return make_allsame_code(x)
     elseif length(x) == 255
         return make_not_code(x)
     elseif length(x) == length(Set([i & 0x0f for i in x]))
-        #println("Unique nibble")
         return make_unique_nibble_code(x, false)
     elseif length(~x) == length(Set([i & 0x0f for i in ~x]))
-        #println("Invert unique nibble") 
         return make_unique_nibble_code(x, true)
     elseif iscontiguous(x)
-        #println("Range code")
         return make_range_code(x)
     elseif iscontiguous(~x)
-    # Inverted range
-        #println("Inverted range code")
         return make_inv_range_code(x)
     elseif maximum(x) - minimum(x) < 16
-        #println("Within 16")
         return make_within16_code(x)
-    # Inverted ASCII
     elseif minimum(x) > 127
-        #println("Inv ascii")
         return make_128_veccode(x, true, true)
-    # Ascii
     elseif maximum(x) < 128
-        #println("ASCII")
         return make_128_veccode(x, true, false)
-    # Inverted within 128
     elseif maximum(~x) - minimum(~x) < 128
-        #println("Inverted 128")
         return make_128_veccode(x, false, true)
-    # Within 128
     elseif maximum(x) - minimum(x) < 128
-        #println("128 code")
         return make_128_veccode(x, false, false)
     elseif length(x) < 9
-        #println("8 set code")
         return make_8elem_veccode(x)
     else
-        #println("Generic")
         return make_generic_veccode(x)
     end
 end
@@ -412,5 +421,61 @@ end
 
 
 ## experimental code
+import Automa: traverse, Machine
+
+function get_simd_loops(machine::Machine)
+    sets = ByteSet[]
+    for node in traverse(machine.start)
+        for (edge, dest) in node.edges
+            # Only have self loops
+            node === dest || continue
+
+            # Only no-actions edges
+            isempty(edge.actions) || continue
+            push!(sets, edge.labels)
+        end
+    end
+    return sets
+end
+
+#=
+function foo_code(byteset::ByteSet)
+    return quote
+        while true
+            x = loadvector($DEFVEC, pointer(data, p))
+            y = $(gencode(byteset))
+            if p > p_end - $(sizeof(DEFVEC)) || !haszerolayout(y)
+                i = 1
+                @inbounds while (y[i] == 0x00) & (p ≤ p_end)
+                    i += 1
+                    p += 1
+                end
+                break
+            end
+            p += $(sizeof(DEFVEC))
+        end
+    end
+end
+=#
+
+function foo_code(byteset::ByteSet)
+    return quote
+        x = loadvector($DEFVEC, pointer(data, p))
+        y = $(gencode(byteset))
+        while p ≤ p_end - $(sizeof(DEFVEC)) && haszerolayout(y)
+            p += $(sizeof(DEFVEC))
+            x = loadvector($DEFVEC, pointer(data, p))
+            y = $(gencode(byteset))
+        end
+        p = min(p_end + 1, p + vpmovmskb(y)) 
+    end
+end
+
+
+@eval function foo(data::Vector{UInt8}, p::Int)
+    p_end = length(data)
+    $(foo_code(bs_inv_unique_nibble))
+    return p
+end
 
 end # t
