@@ -98,7 +98,11 @@ end
 @inline function leading_zero_bytes(v::v256)
     eqzero = vpcmpeqb(v, _ZERO_v256).data
     packed = ccall("llvm.x86.avx2.pmovmskb", llvmcall, UInt32, (NTuple{32, VecElement{UInt8}},), eqzero)
-    return leading_ones(packed)
+    @static if ENDIAN_BOM == 0x04030201
+        return trailing_ones(packed)
+    else
+        return leading_ones(packed)
+    end
 end
 
 # vpmovmskb requires AVX2, so we fall back to this.
