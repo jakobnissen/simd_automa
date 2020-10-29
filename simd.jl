@@ -78,7 +78,7 @@ let
         vpcmpeqb_code = replace(vpcmpeqb_template, "<N x" => "<$(sizeof(T)) x")
 
         @eval @inline function vpcmpeqb(a::$ST, b::$ST)
-            $(ST)(Base.lvmcall($vpcmpeqb_code, $T, Tuple{$T, $T}, a.data, b.data))
+            $(ST)(Base.llvmcall($vpcmpeqb_code, $T, Tuple{$T, $T}, a.data, b.data))
         end
 
         @eval @inline function vpshufb(a::$ST, b::$ST)
@@ -95,19 +95,11 @@ let
     end
 end
 
-"""
-    vpmovmskb(a::v256) -> v256
-
-Moves the upper bits of each byte in a `v256` value to an `UInt32`.
-Maps to the AVX2 instruction `vpmovmskb`.
-"""
-@inline function vpmovmskb(v::v256)
+@inline function leading_zero_bytes(v::v256)
     eqzero = vpcmpeqb(v, _ZERO_v256).data
     packed = ccall("llvm.x86.avx2.pmovmskb", llvmcall, UInt32, (NTuple{32, VecElement{UInt8}},), eqzero)
     return leading_ones(packed)
 end
-
-@inline leading_zero_bytes(v::v256) = vpmovmskb(v)
 
 # vpmovmskb requires AVX2, so we fall back to this.
 @inline function leading_zero_bytes(v::v128)
@@ -198,7 +190,7 @@ end
 @inline vec_same(x::BVec, y::UInt8) = x ⊻ y
 
 function load_lut(::Type{T}, v::Vector{UInt8}) where {T <: BVec}
-    v = repeat(v, div(sizeof(T), 16))
+    T === v256 && (v = repeat(v, 2))
     return unsafe_load(Ptr{T}(pointer(v)))
 end  
 
@@ -415,6 +407,13 @@ bs_generic = ByteSet(rand(0x00:0xff, 75))
     y = $(gencode(bs_generic))
 end
 
+for symbol in [:same, :not, :unique_nibble, :inv_unique_nibble, :range, :inv_range,
+    :within_16, :inv_ascii, :ascii, :inv_128, :128, :8, :generic]
+    r = @eval test_function($(Symbol("f_", string(symbol))), $(Symbol("bs_", string(symbol))))
+    if !r
+        error("Function $symbol failed!")
+    end
+end
 
 ## experimental code
 import Automa: traverse, Machine
@@ -434,22 +433,25 @@ function get_simd_loops(machine::Machine)
     return sets
 end
 
+# Note: This function has been carefully crafted to produce (nearly) optimal
+# assembly code for AVX2-capable CPUs. Change with great care.
 function foo_code(byteset::ByteSet)
     return quote
-        x = loadvector($DEFVEC, pointer(data, p))
-        y = $(gencode(byteset))
-        while p ≤ p_end - $(sizeof(DEFVEC)) && haszerolayout(y)
-            p += $(sizeof(DEFVEC))
+        while true
             x = loadvector($DEFVEC, pointer(data, p))
             y = $(gencode(byteset))
+            if !haszerolayout(y) || p > p_end - $(sizeof(DEFVEC))
+                p = min(p_end + 1, p + leading_zero_bytes(y))
+                break
+            end
+            p += $(sizeof(DEFVEC))
         end
-        p = min(p_end + 1, p + leading_zero_bytes(y)) 
     end
 end
 
 @eval function foo(data::Vector{UInt8}, p::Int)
     p_end = length(data)
-    $(foo_code(bs_inv_unique_nibble))
+    $(foo_code(bs_generic))
     return p
 end
 
