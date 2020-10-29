@@ -5,7 +5,6 @@ module t
 
 using SIMD
 using Libdl
-using Base: llvmcall
 import Automa: ByteSet
 
 const v256 = Vec{32, UInt8}
@@ -59,8 +58,6 @@ See also: [`vpcmpeqb`](@ref)
 function vec_uge end
 
 let
-    nt256 = NTuple{32, VecElement{UInt8}}
-    nt128 = NTuple{16, VecElement{UInt8}}
     # icmp eq instruction yields bool (i1) values. We extend with sext to 0x00/0xff.
     # since that's the native output of vcmpeqb instruction, LLVM will optimize it
     # to just that.
@@ -81,7 +78,7 @@ let
         vpcmpeqb_code = replace(vpcmpeqb_template, "<N x" => "<$(sizeof(T)) x")
 
         @eval @inline function vpcmpeqb(a::$ST, b::$ST)
-            $(ST)(Base.llvmcall($vpcmpeqb_code, $T, Tuple{$T, $T}, a.data, b.data))
+            $(ST)(Base.lvmcall($vpcmpeqb_code, $T, Tuple{$T, $T}, a.data, b.data))
         end
 
         @eval @inline function vpshufb(a::$ST, b::$ST)
@@ -102,7 +99,7 @@ end
     vpmovmskb(a::v256) -> v256
 
 Moves the upper bits of each byte in a `v256` value to an `UInt32`.
-Maps to the AVX2 instruction `vpmovmskb`
+Maps to the AVX2 instruction `vpmovmskb`.
 """
 @inline function vpmovmskb(v::v256)
     eqzero = vpcmpeqb(v, _ZERO_v256).data
@@ -339,7 +336,6 @@ function gencode(x::ByteSet)
     end
 end
 
-
 ###
 function test_function(f::Function, bs::ByteSet)
     pass = true
@@ -438,26 +434,6 @@ function get_simd_loops(machine::Machine)
     return sets
 end
 
-#=
-function foo_code(byteset::ByteSet)
-    return quote
-        while true
-            x = loadvector($DEFVEC, pointer(data, p))
-            y = $(gencode(byteset))
-            if p > p_end - $(sizeof(DEFVEC)) || !haszerolayout(y)
-                i = 1
-                @inbounds while (y[i] == 0x00) & (p ≤ p_end)
-                    i += 1
-                    p += 1
-                end
-                break
-            end
-            p += $(sizeof(DEFVEC))
-        end
-    end
-end
-=#
-
 function foo_code(byteset::ByteSet)
     return quote
         x = loadvector($DEFVEC, pointer(data, p))
@@ -467,10 +443,9 @@ function foo_code(byteset::ByteSet)
             x = loadvector($DEFVEC, pointer(data, p))
             y = $(gencode(byteset))
         end
-        p = min(p_end + 1, p + vpmovmskb(y)) 
+        p = min(p_end + 1, p + leading_zero_bytes(y)) 
     end
 end
-
 
 @eval function foo(data::Vector{UInt8}, p::Int)
     p_end = length(data)
