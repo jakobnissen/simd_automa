@@ -2,6 +2,17 @@ module t
 
 # This should be an Automa.Simd module that should be loaded
 # All the vec_* (soon to be zero_) function should be exported
+# export anything that is used in generated code!
+
+# DONE # 0. Fix the code itself so it generates correct code with variable symbols
+# DONE # 1. Rename everything to proper names
+# DONE # 2. Figure out what to export and write export statements
+# 3. Add imports SIMD/Libdl and add to Project.toml
+# 4. Create the new module and copy-paste stuff into it.
+# 5: Copy-paste tests in and add more. Also add tests for non-AVX2.
+# 6. Run the lower-level tests to make sure the generated code works.
+# 7. Now add a SIMD loop unroller
+
 
 using SIMD
 using Libdl
@@ -135,7 +146,7 @@ end
 Base.:~(x::ByteSet) = ByteSet(~x.a, ~x.b, ~x.c, ~x.d)
 iscontiguous(x::ByteSet) = maximum(x) - minimum(x) == length(x) - 1
 
-@inline function vec_generic(x::T, topzero::T, topone::T) where {T <: BVec}
+@inline function zerovec_generic(x::T, topzero::T, topone::T) where {T <: BVec}
     lower = vpshufb(topzero, x)
     upper = vpshufb(topone, x ⊻ 0b10000000)
     bitmap = lower | upper
@@ -148,13 +159,13 @@ end
 # If not inverted, all inputs with top bit will be set to 0x00, and then inv'd to 0xff.
 # This will cause all shifts to fail.
 # If inverted and ascii, we set offset to 0x80
-@inline function vec_within128(x::T, lut::T, offset::UInt8, f::Function) where {T <: BVec}
+@inline function zerovec_128(x::T, lut::T, offset::UInt8, f::Function) where {T <: BVec}
     y = x - offset
     bitmap = f(vpshufb(lut, y))
     return bitmap & bitshift_ones(shrl4(y))
 end
 
-@inline function vec_8elem(x::T, lut1::T, lut2::T) where {T <: BVec}
+@inline function zerovec_8elem(x::T, lut1::T, lut2::T) where {T <: BVec}
     # Get a 8-bit bitarray of the possible ones
     mask = vpshufb(lut1, x & 0b00001111)
     shifted = vpshufb(lut2, shrl4(x))
@@ -162,7 +173,7 @@ end
 end
 
 # Here's one where they're 16 apart at most.
-@inline function vec_within16(x::T, lut::T, offset::UInt8) where {T <: BVec}
+@inline function zerovec_16(x::T, lut::T, offset::UInt8) where {T <: BVec}
     y = x - offset
     lower = vpshufb(lut, y & 0b00001111)
     return lower | (y & 0b11110000) 
@@ -170,14 +181,14 @@ end
 
 # One where it's a single range. After subtracting low, all values below end
 # up above due to overflow and we can simply do a single ge check
-@inline function vec_range(x::BVec, low::UInt8, len::UInt8)
+@inline function zerovec_range(x::BVec, low::UInt8, len::UInt8)
     vec_uge((x - low), typeof(x)(len))
 end
 
 # One where, in all the disallowed values, the lower nibble is unique.
 # This one is surprisingly common and very efficient.
 # If all 0x80:0xff are allowed, the mask can be 0xff, and is compiled away
-@inline function vec_invert_unique_nibble(x::T, lut::T, mask::UInt8) where {T <: BVec}
+@inline function zerovec_inv_nibble(x::T, lut::T, mask::UInt8) where {T <: BVec}
     # If upper bit is set, vpshufb yields 0x00. 0x00 is not equal to any bytes with the
     # upper biset set, so the comparison will return 0x00, allowing it.
     return vpcmpeqb(x, vpshufb(lut, x & mask))
@@ -185,13 +196,13 @@ end
 
 
 # Same as above, but inverted. Even better!
-@inline function vec_unique_nibble(x::T, lut::T, mask::UInt8) where {T <: BVec}
+@inline function zerovec_nibble(x::T, lut::T, mask::UInt8) where {T <: BVec}
     return x ⊻ vpshufb(lut, x & mask)
 end
 
 # Simplest of all!
-@inline vec_not(x::BVec, y::UInt8) = vpcmpeqb(x, typeof(x)(y))
-@inline vec_same(x::BVec, y::UInt8) = x ⊻ y
+@inline zerovec_not(x::BVec, y::UInt8) = vpcmpeqb(x, typeof(x)(y))
+@inline zerovec_same(x::BVec, y::UInt8) = x ⊻ y
 
 function load_lut(::Type{T}, v::Vector{UInt8}) where {T <: BVec}
     T === v256 && (v = repeat(v, 2))
@@ -249,17 +260,17 @@ function unique_lut(::Type{T}, byteset::ByteSet, invert::Bool) where {T <: BVec}
 end 
 
 ########## Testing code below
-function make_generic_veccode(x::ByteSet)
+function gen_zero_generic(sym::Symbol, x::ByteSet)
     lut1, lut2 = generic_luts(DEFVEC, x, 0x00, true)
-    return :(vec_generic(x, $lut1, $lut2))
+    return :(zerovec_generic($sym, $lut1, $lut2))
 end
 
-function make_8elem_veccode(x::ByteSet)
+function gen_zero_8elem(sym::Symbol, x::ByteSet)
     lut1, lut2 = elem8_luts(DEFVEC, x)
-    return :(vec_8elem(x, $lut1, $lut2))
+    return :(zerovec_8elem($sym, $lut1, $lut2))
 end
 
-function make_128_veccode(x::ByteSet, ascii::Bool, inverted::Bool)
+function gen_zero_128(sym::Symbol, x::ByteSet, ascii::Bool, inverted::Bool)
     if ascii && !inverted
         offset, f, invert = 0x00, ~, false
     elseif ascii && inverted
@@ -270,66 +281,67 @@ function make_128_veccode(x::ByteSet, ascii::Bool, inverted::Bool)
         offset, f, invert = minimum(~x), identity, true
     end
     lut = generic_luts(DEFVEC, x, offset, invert)[1]
-    return :(vec_within128(x, $lut, $offset, $f))
+    return :(zerovec_128($sym, $lut, $offset, $f))
 end
 
-function make_within16_code(x::ByteSet)
+function gen_zero_16(sym::Symbol, x::ByteSet)
     lut = within16_lut(DEFVEC, x)
-    return :(vec_within16(x, $lut, $(minimum(x))))
+    return :(zerovec_16($sym, $lut, $(minimum(x))))
 end
 
-function make_range_code(x::ByteSet)
-    return :(vec_range(x, $(minimum(x)), $(UInt8(length(x)))))
+function gen_zero_range(sym::Symbol, x::ByteSet)
+    return :(zerovec_range($sym, $(minimum(x)), $(UInt8(length(x)))))
 end
 
-function make_inv_range_code(x::ByteSet)
+function gen_zero_inv_range(sym::Symbol, x::ByteSet)
     # An inverted range is the same as a shifted range, because UInt8 arithmetic
     # is circular. So we can simply adjust the shift, and return regular vec_range
-    return :(vec_range(x, $(maximum(~x) + 0x01), $(UInt8(length(x)))))
+    return :(zerovec_range($sym, $(maximum(~x) + 0x01), $(UInt8(length(x)))))
 end
 
-function make_unique_nibble_code(x::ByteSet, invert::Bool)
+function gen_zero_nibble(sym::Symbol, x::ByteSet, invert::Bool)
     lut = unique_lut(DEFVEC, x, invert)
     mask = maximum(invert ? ~x : x) > 0x7f ? 0x0f : 0xff
     if invert
-        return :(vec_invert_unique_nibble(x, $lut, $mask))
+        return :(zerovec_inv_nibble($sym, $lut, $mask))
     else
-        return :(vec_unique_nibble(x, $lut, $mask))
+        return :(zerovec_nibble($sym, $lut, $mask))
     end
 end
 
-make_allsame_code(x::ByteSet) = :(vec_same(x, $(minimum(x))))
-make_not_code(x::ByteSet) = :(vec_not(x, $(minimum(~x))))
+gen_zero_same(sym::Symbol, x::ByteSet) = :(zerovec_same($sym, $(minimum(x))))
+gen_zero_not(sym::Symbol, x::ByteSet) = :(zerovec_not($sym, $(minimum(~x))))
 
 # TODO: Make something useful of this.
-function gencode(x::ByteSet)
+function gencode(ressym::Symbol, sym::Symbol, x::ByteSet)
     if length(x) == 1
-        return make_allsame_code(x)
+        expr = gen_zero_same(sym, x)
     elseif length(x) == 255
-        return make_not_code(x)
+        return gen_zero_not(sym, x)
     elseif length(x) == length(Set([i & 0x0f for i in x]))
-        return make_unique_nibble_code(x, false)
+        expr = gen_zero_nibble(sym, x, false)
     elseif length(~x) == length(Set([i & 0x0f for i in ~x]))
-        return make_unique_nibble_code(x, true)
+        expr = gen_zero_nibble(sym, x, true)
     elseif iscontiguous(x)
-        return make_range_code(x)
+        expr = gen_zero_range(sym, x)
     elseif iscontiguous(~x)
-        return make_inv_range_code(x)
+        expr = gen_zero_inv_range(sym, x)
     elseif maximum(x) - minimum(x) < 16
-        return make_within16_code(x)
+        expr = gen_zero_16(sym, x)
     elseif minimum(x) > 127
-        return make_128_veccode(x, true, true)
+        expr = gen_zero_128(sym, x, true, true)
     elseif maximum(x) < 128
-        return make_128_veccode(x, true, false)
+        expr = gen_zero_128(sym, x, true, false)
     elseif maximum(~x) - minimum(~x) < 128
-        return make_128_veccode(x, false, true)
+        expr = gen_zero_128(sym, x, false, true)
     elseif maximum(x) - minimum(x) < 128
-        return make_128_veccode(x, false, false)
+        expr = gen_zero_128(sym, x, false, false)
     elseif length(x) < 9
-        return make_8elem_veccode(x)
+        expr = gen_zero_8elem(sym, x)
     else
-        return make_generic_veccode(x)
+        expr = gen_zero_generic(sym, x)
     end
+    return :($ressym = $(expr))
 end
 
 ###
@@ -340,110 +352,45 @@ function test_function(f::Function, bs::ByteSet)
         for j in 0x00:0x0f
             n = (0x10 * i) + j
             pass &= ((n in bs) == (v[j+1] == 0x00))
-            #println(pass, " ", n in bs, " ", v[j+1] == 0x00)
         end
     end
     return pass
 end
 
 bs_same = ByteSet([0x07])
-@eval function f_same(x)
-    y = $(gencode(bs_same))
-end
-
-bs_not = ~ByteSet([0xb3])
-@eval function f_not(x)
-    y = $(gencode(bs_not))
-end
-
-bs_unique_nibble = ByteSet([0x02, 0x0a, 0x1b, 0x1c, 0x1d, 0x20, 0x7e])
-@eval function f_unique_nibble(x)
-    y = $(make_unique_nibble_code(bs_unique_nibble, false))
-end
-
-bs_inv_unique_nibble = ~bs_unique_nibble
-@eval function f_inv_unique_nibble(x)
-    y = $(make_unique_nibble_code(bs_inv_unique_nibble, true))
-end
-
+bs_not = ~bs_same
+bs_nibble = ByteSet([0x02, 0x0a, 0x1b, 0x1c, 0x1d, 0x20, 0x7e])
+bs_inv_nibble = ~bs_nibble
 bs_range = ByteSet(0xa9:0xc1)
-@eval function f_range(x)
-    y = $(gencode(bs_range))
-end
-
 bs_inv_range = ByteSet([0x00:0x09; 0x4a:0xff])
-@eval function f_inv_range(x)
-    y = $(gencode(bs_inv_range))
-end
-
-bs_within_16 = ByteSet([0x45, 0x48, 0x49, 0x50, 0x55, 0x53])
-@eval function f_within_16(x)
-    y = $(gencode(bs_within_16))
-end
-
+bs_16 = ByteSet([0x45, 0x48, 0x49, 0x50, 0x55, 0x53])
 bs_inv_ascii = ByteSet(rand(0x8a:0xf1, 50))
-@eval function f_inv_ascii(x)
-    y = $(gencode(bs_inv_ascii))
-end
-
 bs_ascii = ByteSet(rand(0x0a:0x61, 50))
-@eval function f_ascii(x)
-    y = $(gencode(bs_ascii))
-end
-
 bs_inv_128 = ~ByteSet(rand(0x31:0xa1, 50))
-@eval function f_inv_128(x)
-    y = $(gencode(bs_inv_128))
-end
-
 bs_128 = ByteSet(rand(0x31:0xa1, 50))
-@eval function f_128(x)
-    y = $(gencode(bs_128))
-end
-
-bs_8 = ByteSet(rand(0x00:0xff, 8))
-@eval function f_8(x)
-    y = $(gencode(bs_8))
-end
-
+bs_8elem = ByteSet(rand(0x00:0xff, 8))
 bs_generic = ByteSet(rand(0x00:0xff, 75))
-@eval function f_generic(x)
-    y = $(gencode(bs_generic))
-end
 
-for symbol in [:same, :not, :unique_nibble, :inv_unique_nibble, :range, :inv_range,
-    :within_16, :inv_ascii, :ascii, :inv_128, :128, :8, :generic]
+for symbol in [:same, :not, :nibble, :inv_nibble, :range, :inv_range,
+    Symbol(:16), :inv_ascii, :ascii, :inv_128, Symbol(:128), Symbol("8elem"), :generic]
+    #@eval function $(Symbol("f_", string(symbol)))(x::DEFVEC)
+    bs = @eval $(Symbol("bs_", string(symbol)))
+    @eval function $(Symbol("f_", string(symbol)))(x::DEFVEC)
+        $(gencode(:y, :x, bs))
+    end
     r = @eval test_function($(Symbol("f_", string(symbol))), $(Symbol("bs_", string(symbol))))
     if !r
         error("Function $symbol failed!")
     end
 end
 
-## experimental code
-import Automa: traverse, Machine
-
-function get_simd_loops(machine::Machine)
-    sets = ByteSet[]
-    for node in traverse(machine.start)
-        for (edge, dest) in node.edges
-            # Only have self loops
-            node === dest || continue
-
-            # Only no-actions edges
-            isempty(edge.actions) || continue
-            push!(sets, edge.labels)
-        end
-    end
-    return sets
-end
-
 # Note: This function has been carefully crafted to produce (nearly) optimal
 # assembly code for AVX2-capable CPUs. Change with great care.
-function foo_code(byteset::ByteSet)
+function foo_code(xsym::Symbol, ysym::Symbol, byteset::ByteSet)
     return quote
         while true
-            x = loadvector($DEFVEC, pointer(data, p))
-            y = $(gencode(byteset))
+            $xsym = loadvector($DEFVEC, pointer(data, p))
+            $(gencode(ysym, xsym, byteset))
             if !haszerolayout(y) || p > p_end - $(sizeof(DEFVEC))
                 p = min(p_end + 1, p + leading_zero_bytes(y))
                 break
@@ -455,8 +402,25 @@ end
 
 @eval function foo(data::Vector{UInt8}, p::Int)
     p_end = length(data)
-    $(foo_code(bs_generic))
+    $(foo_code(:x, :y, bs_generic))
     return p
 end
 
+# We need to export all names that can end up in the generated code.
+# else the generated code will lead to NameError
+export leading_zero_bytes,
+    haszerolayout,
+    loadvector,
+    zerovec_128,
+    zerovec_16,
+    zerovec_8elem,
+    zerovec_generic,
+    zerovec_inv_nibble,
+    zerovec_nibble,
+    zerovec_not,
+    zerovec_range,
+    zerovec_same
+
 end # t
+
+
