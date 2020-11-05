@@ -1,0 +1,66 @@
+# Jump to current state
+if cs == 1
+    @goto state_1
+elseif cs == 2
+    @goto state_2
+[ ... ]
+end
+
+# Actions on multiple edges
+@label action_1
+    [ action 1 code ]
+    # If action_2 is present on a single edge and
+    # follows action_1, then it goes here, and then the
+    # jump code below should reflect action2's aftermath
+    [ action 2 code ]
+    if jump == 5
+        jump = 11
+        @goto action_5
+    else
+        jump = 12
+        @goto node_5_edge_11
+    end
+[ ... ]
+
+# States
+@label state_1
+    cs = 1
+    p += 1
+    if p > p_end
+        @goto exit
+    end
+    
+    # simd code if possible
+    $(SIMD loop)
+    if p > p_end
+        @goto exit
+    end
+    # end of simd code
+
+    byte = @inbounds data[p]
+    
+    # dispatch code
+    if byte in 0x1a:0x5c || (byte in  [ ... ]
+        # In this case, we have an action on only this edge
+        [ action code ... ]
+        @goto state_4
+    elseif byte in 0xe2:0xf1 || (byte in  [ ... ]
+        # Here, we have a chain of actions
+        jump = 5 # next action after the first one
+        @goto action_1
+    else
+        # Remember to also add actions of EOF edges.
+        # These are special-cased for Automa right now,
+        # but they don't need to.
+        # Add only when it's a legitimate EOF, not a
+        # unexpected byte.
+        @goto exit
+    end
+
+@label exit
+    if cs in [ machine's accept states ]
+        cs = 0
+    else
+        cs = -cs
+    end
+
